@@ -35,6 +35,8 @@ from fp16 import FP16_Module
 from model import GPT2Model
 from utils import print_rank_0
 
+from flask import Flask, request, abort
+
 USE_TORCH_DDP = True
 
 
@@ -208,6 +210,41 @@ def setup_model(args):
     return model
 
 
+def prepare_tokenizer(args):
+    tokenizer_args = {
+        'tokenizer_type': args.tokenizer_type,
+        'corpus': None,
+        'model_path': args.tokenizer_path,
+        'vocab_size': args.vocab_size,
+        'model_type': args.tokenizer_model_type,
+        'cache_dir': args.cache_dir,
+        'add_eop': args.hierarchical}
+    tokenizer = make_tokenizer(**tokenizer_args)
+
+    num_tokens = tokenizer.num_tokens
+    before = num_tokens
+    after = before
+    multiple = args.make_vocab_size_divisible_by
+    while (after % multiple) != 0:
+        after += 1
+    print_rank_0('> padded vocab (size: {}) with {} dummy '
+                 'tokens (new size: {})'.format(
+        before, after - before, after))
+
+    args.tokenizer_num_tokens = after
+    args.tokenizer_num_type_tokens = tokenizer.num_type_tokens
+    args.eod_token = tokenizer.get_command('eos').Id
+
+    # after = tokenizer.num_tokens
+    # while after % mpu.get_model_parallel_world_size() != 0:
+    #     after += 1
+
+    args.vocab_size = after
+    print("prepare tokenizer done", flush=True)
+
+    return tokenizer
+
+
 def get_batch(context_tokens, device, args):
     tokens = context_tokens
     tokens = tokens.view(args.batch_size, -1).contiguous()
@@ -253,76 +290,12 @@ def top_k_logits(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     return logits
 
 
-def sample_sequence(model, tokenizer, context_tokens_tensor, context_length, args, device, mems=None, end_token=None):
-    tokens, attention_mask, position_ids = get_batch(context_tokens_tensor, device, args)
-
-    counter = 0
-    if mems is None:
-        mems = []
-    if end_token is None:
-        end_token = args.eod_token
-    org_context_length = context_length
-    while counter < (args.out_seq_length - org_context_length):
-        if counter == 0:
-            logits, *mems = model(tokens, position_ids, attention_mask, *mems)
-        else:
-            index = org_context_length + counter
-            logits, *mems = model(tokens[:, index - 1: index], tokens.new_ones((1, 1)) * (index - 1),
-                                  tokens.new_ones(1, 1, 1, args.mem_length + 1, device=tokens.device,
-                                                  dtype=torch.float), *mems)
-        logits = logits[:, -1]
-        logits /= args.temperature
-        logits = top_k_logits(logits, top_k=args.top_k, top_p=args.top_p)
-        log_probs = F.softmax(logits, dim=-1)
-        prev = torch.multinomial(log_probs, num_samples=1)[0]
-        is_end = prev == end_token
-        if is_end:
-            break
-        tokens = torch.cat((tokens, prev.view(1, 1)), dim=1)
-        context_length += 1
-        counter += 1
-        if mpu.get_model_parallel_rank() == 0 and counter % 16 == 0:
-            output_tokens_list = tokens.view(-1).contiguous()
-            decode_tokens = tokenizer.DecodeIds(output_tokens_list.tolist())
-            if mpu.get_model_parallel_rank() == 0 and (counter % 128 == 0 or is_end):
-                os.system('clear')
-                trim_decode_tokens = decode_tokens
-                print(trim_decode_tokens, flush=True)
-    output_tokens_list = tokens.view(-1).contiguous()
-    return output_tokens_list, mems
-
-
-def read_context(tokenizer, args, output, raw_text=None):
-    terminate_runs, skip_run = 0, 0
+def read_context(prompt, tokenizer, args):
     if mpu.get_model_parallel_rank() == 0:
-        while True:
-            if not raw_text:
-                raw_text = input("\nContext prompt (stop to exit) >>> ")
-            if not raw_text:
-                print('Prompt should not be empty!')
-                continue
-            if raw_text == "stop":
-                terminate_runs = 1
-                break
-            output.write(raw_text)
-            context_tokens = tokenizer.EncodeAsIds(raw_text).tokenization
-            context_length = len(context_tokens)
-
-            if context_length >= args.seq_length:
-                print("\nContext length", context_length,
-                      "\nPlease give smaller context than the window length!")
-                continue
-            break
+        context_tokens = tokenizer.EncodeAsIds(prompt).tokenization
+        context_length = len(context_tokens)
     else:
         context_length = 0
-
-    terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
-    torch.distributed.broadcast(terminate_runs_tensor, mpu.get_model_parallel_src_rank(),
-                                group=mpu.get_model_parallel_group())
-    terminate_runs = terminate_runs_tensor[0].item()
-
-    if terminate_runs == 1:
-        return terminate_runs, None, None, None
 
     context_length_tensor = torch.cuda.LongTensor([context_length])
 
@@ -336,86 +309,121 @@ def read_context(tokenizer, args, output, raw_text=None):
     torch.distributed.broadcast(context_tokens_tensor, mpu.get_model_parallel_src_rank(),
                                 group=mpu.get_model_parallel_group())
     if mpu.get_model_parallel_rank() != 0:
-        raw_text = tokenizer.DecodeIds(context_tokens_tensor.tolist())
-    return terminate_runs, raw_text, context_tokens_tensor, context_length
+        prompt = tokenizer.DecodeIds(context_tokens_tensor.tolist())
+    return prompt, context_tokens_tensor, context_length
 
 
-def generate_samples(model, tokenizer, args, device):
+def sample_sequence(model, stop_words, tokenizer, context_tokens_tensor, context_length, args, device, mems=None):
+    tokens, attention_mask, position_ids = get_batch(context_tokens_tensor, device, args)
+
+    counter = 0
+    if mems is None:
+        mems = []
+
+    while counter < args.out_seq_length:
+        if counter == 0:
+            logits, *mems = model(tokens, position_ids, attention_mask, *mems)
+        else:
+            index = context_length + counter
+            new_position_ids = tokens.new_ones((1, 1)) * (index - 1)
+            new_attention_mask = tokens.new_ones(1, 1, 1, args.mem_length + 1, device=tokens.device, dtype=torch.float)
+            logits, *mems = model(tokens[:, index - 1: index], new_position_ids, new_attention_mask, *mems)
+
+        logits = logits[:, -1]
+        logits /= args.temperature
+        logits = top_k_logits(logits, top_k=args.top_k, top_p=args.top_p)
+        log_probs = F.softmax(logits, dim=-1)
+        
+        prev = torch.multinomial(log_probs, num_samples=1)[0]
+        if prev == args.eod_token:
+            break
+        elif prev in stop_words and counter > args.min_out_seq_length:
+            tokens = torch.cat((tokens, prev.view(1, 1)), dim=1)
+            break
+
+        tokens = torch.cat((tokens, prev.view(1, 1)), dim=1)
+        counter += 1
+
+    output_tokens_list = tokens.view(-1).contiguous()
+    return output_tokens_list, mems
+
+
+def generate_samples(prompt, stop_words, model, tokenizer, args, device):
     model.eval()
-    output_path = "./samples"
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-    output_path = os.path.join(output_path, f"sample-{datetime.now().strftime('%m-%d-%H-%M')}.txt")
-    with torch.no_grad(), open(output_path, "w") as output:
-        input_file = None
-        if args.test_data_path is not None:
-            input_file = open(args.test_data_path)
-        while True:
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
-            raw_text = None
-            if input_file is not None:
-                raw_text = input_file.readline().strip()
-                if not raw_text:
-                    return
-            terminate_runs, raw_text, context_tokens_tensor, context_length = read_context(tokenizer, args, output,
-                                                                                           raw_text=raw_text)
-            if terminate_runs == 1:
-                return
-            start_time = time.time()
-            output_tokens_list, _ = sample_sequence(model, tokenizer, context_tokens_tensor, context_length, args,
-                                                    device)
-            if mpu.get_model_parallel_rank() == 0:
-                os.system('clear')
-                print("\nTaken time {:.2f}\n".format(time.time() - start_time), flush=True)
-                print("\nContext:", raw_text, flush=True)
-                decode_tokens = tokenizer.DecodeIds(output_tokens_list.tolist())
-                trim_decode_tokens = decode_tokens[len(raw_text):]
-                print("\nGPT2:", trim_decode_tokens, flush=True)
-                output.write(trim_decode_tokens + "\n")
+    with torch.no_grad():
+        torch.distributed.barrier(group=mpu.get_model_parallel_group())
 
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
+        start_time = time.time()
+        prompt, context_tokens_tensor, context_length = read_context(prompt, tokenizer, args)
+        output_tokens_list, _ = sample_sequence(model, stop_words, tokenizer, context_tokens_tensor, context_length, args, device)
+        decode_tokens = tokenizer.DecodeIds(output_tokens_list.tolist())
+        trim_decode_tokens = decode_tokens[len(prompt):]
+
+        torch.distributed.barrier(group=mpu.get_model_parallel_group())
+        print('Length range: {} - {}'.format(args.min_out_seq_length, args.out_seq_length))
+        print('Prompt: {}'.format(prompt))
+        print('Generation: {}'.format(trim_decode_tokens))
+        print("Taken time {:.2f}".format(time.time() - start_time), flush=True)
+        return trim_decode_tokens
 
 
-def prepare_tokenizer(args):
-    tokenizer_args = {
-        'tokenizer_type': args.tokenizer_type,
-        'corpus': None,
-        'model_path': args.tokenizer_path,
-        'vocab_size': args.vocab_size,
-        'model_type': args.tokenizer_model_type,
-        'cache_dir': args.cache_dir,
-        'add_eop': args.hierarchical}
-    tokenizer = make_tokenizer(**tokenizer_args)
+def generate(request, model, tokenizer, args):
+    print('Processing request: {}'.format(request.json))
+    PROMPT_KEY = 'prompt'
+    MAX_TOKENS_KEY = 'max_length'
+    MIN_TOKENS_KEY = 'min_length'
+    TEMPERATURE_KEY = 'temperature'
+    TOP_K_KEY = 'top_k'
+    TOP_P_KEY = 'top_p'
+    STOP_WORDS_KEY = 'stop_words'
 
-    num_tokens = tokenizer.num_tokens
-    before = num_tokens
-    after = before
-    multiple = args.make_vocab_size_divisible_by
-    while (after % multiple) != 0:
-        after += 1
-    print_rank_0('> padded vocab (size: {}) with {} dummy '
-                 'tokens (new size: {})'.format(
-        before, after - before, after))
+    DEFAULT_MAX_TOKEN = 1024
+    DEFAULT_MIN_TOKEN = 32
+    DEFAULT_TEMPERATURE = 0.8
+    DEFAULT_TOP_P = 0.8
+    DEFAULT_TOP_K = 100
 
-    args.tokenizer_num_tokens = after
-    args.tokenizer_num_type_tokens = tokenizer.num_type_tokens
-    args.eod_token = tokenizer.get_command('eos').Id
+    char_map = {
+        ',': '，',
+        '.': '。',
+        ':': '：',
+        '!': '！',
+        '?': '？',
+        '(': '（',
+        ')': '）',
+        '#': '\n',
+    }
 
-    # after = tokenizer.num_tokens
-    # while after % mpu.get_model_parallel_world_size() != 0:
-    #     after += 1
+    if not request.json or not PROMPT_KEY in request.json:
+            abort(400)
 
-    args.vocab_size = after
-    print("prepare tokenizer done", flush=True)
+    prompt = request.json[PROMPT_KEY]
+    stop_words = request.json[STOP_WORDS_KEY] if STOP_WORDS_KEY in request.json else []
+    max_token = request.json[MAX_TOKENS_KEY] if MAX_TOKENS_KEY in request.json else DEFAULT_MAX_TOKEN
+    min_token = request.json[MIN_TOKENS_KEY] if MIN_TOKENS_KEY in request.json else DEFAULT_MIN_TOKEN
+    temperature = request.json[TEMPERATURE_KEY] if TEMPERATURE_KEY in request.json else DEFAULT_TEMPERATURE
+    top_p = request.json[TOP_P_KEY] if TOP_P_KEY in request.json else DEFAULT_TOP_P
+    top_k = request.json[TOP_K_KEY] if TOP_K_KEY in request.json else DEFAULT_TOP_K
 
-    return tokenizer
+    args.out_seq_length = max_token
+    args.min_out_seq_length = min_token
+    args.temperature = temperature
+    args.top_k = top_k
+    args.top_p = top_p
+
+    stop_ids = [45225]
+    # for word in stop_words:
+    #     stop_ids += tokenizer.EncodeAsIds(word).tokenization
+
+    prompt = prompt.replace('\n', '#')
+    result = generate_samples(prompt, stop_ids, model, tokenizer, args, torch.cuda.current_device())
+    for en, ch in char_map.items():
+        result = result.replace(en, ch)
+
+    return result, 200
 
 
 def main():
-    """Main training program."""
-
-    print('Generate Samples')
-
     # Disable CuDNN.
     torch.backends.cudnn.enabled = False
 
@@ -439,8 +447,14 @@ def main():
     # setting default batch size to 1
     args.batch_size = 1
 
-    # generate samples
-    generate_samples(model, tokenizer, args, torch.cuda.current_device())
+    # Start up generation service
+    app = Flask(__name__)
+
+    @app.route('/generation', methods=['POST'])
+    def generation():
+        return generate(request, model, tokenizer, args)
+
+    app.run(host='0.0.0.0',port=5000)
 
 
 if __name__ == "__main__":
